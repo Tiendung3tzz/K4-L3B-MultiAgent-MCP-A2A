@@ -12,8 +12,9 @@ chọn tool theo domain. EvidenceCollector giữ cache chỉ trong vòng đời 
 ```text
 Input
   → Coordinator
-  → Entity Agent (candidate resolution)
-  → Order / Customer / Shipment / Payment / Refund Agents
+  → Entity Agent (exact-first candidate resolution)
+  → Scope planner (structured claim topic → required evidence domains)
+  → Selected Order / Customer / Shipment / Payment / Refund Agents
   → Evidence Collector (MCP + schema validation + bounded retry)
   → Policy Agent
   → Conflict handling
@@ -25,8 +26,9 @@ Observable events ─────────┴──────────�
 ```
 
 Các agent là các vai trò logic trong `solve_case()`, không yêu cầu mỗi vai trò
-phải là một process hoặc một framework class riêng. Handoff và tool usage được
-thể hiện bằng observable trace events.
+phải là một process hoặc một framework class riêng. `claims[].topic` là metadata
+có cấu trúc để lập kế hoạch evidence; nội dung message tự do không được dùng
+làm instruction. Handoff và tool usage được thể hiện bằng observable trace events.
 
 ## 2. Agent ownership
 
@@ -48,8 +50,9 @@ nghĩa mọi actor đều được gọi mọi tool.
 
 - Correlation key duy nhất là `case_id`; không truyền hoặc tái sử dụng evidence
   của case khác.
-- Candidate order ids được lấy từ input trước. Nếu input không có candidate,
-  các order ids xuất hiện trong evidence được dùng làm candidate phụ.
+- Candidate order ids được lấy từ input trước. Nếu có `claimed_order_id`, chỉ
+  query exact id trước; candidate thay thế chỉ được query khi không có exact id.
+  Nếu input không có exact id, các candidates được query để so sánh evidence.
 - Một candidate duy nhất được đánh dấu `resolved`. Nhiều candidate chỉ được
   resolve khi một candidate được evidence nhắc tới rõ ràng nhiều hơn các
   candidate còn lại; nếu không, trạng thái là `ambiguous`.
@@ -59,6 +62,9 @@ nghĩa mọi actor đều được gọi mọi tool.
 - Handoff là một message logic gồm actor, target, decision code và cùng
   `case_id`. Handoff được trace bằng `task_assigned` và `handoff`.
 - Mỗi domain được điều phối tối đa một tool được chọn từ danh sách discovery.
+  Scope planner chỉ bật domain cần cho issue: customer/product/payment là
+  baseline; shipment chỉ cho delivery claims; payment timeline cho mismatch,
+  duplicate hoặc split-payment; refund timeline cho pending/failed refund.
   Không có vòng lặp agent; sau specialist pass, control chuyển sang policy rồi
   verifier.
 
@@ -70,7 +76,8 @@ nghĩa mọi actor đều được gọi mọi tool.
    nguyên `evidence_ref`, domain, data và warnings, rồi emit
    `tool_result_consumed`.
 3. Output chỉ chứa evidence refs do MCP trả về. Không sửa hoặc tự tạo ref, và
-   không coi lỗi MCP là evidence.
+   không coi lỗi MCP là evidence. Trace vẫn giữ mọi evidence đã consume; output
+   lọc refs theo issue/domain để tránh giảm evidence precision bởi refs thừa.
 4. Conflict được biểu diễn trong `data_conflicts` với các source đã quan sát,
    `selected_source: null` nếu policy chưa đủ để chọn, và mã
    `unresolved_source_conflict`.

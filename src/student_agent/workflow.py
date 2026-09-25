@@ -17,6 +17,19 @@ MAX_RETRIES = 2
 RETRY_DELAY_SECONDS = 0.05
 MAX_EVIDENCE_REFS = 30
 
+PRIMARY_ISSUES = {
+    "canceled_order_paid",
+    "unavailable_order_paid",
+    "late_delivery_seller",
+    "late_delivery_logistics",
+    "payment_mismatch",
+    "duplicate_charge",
+    "refund_pending",
+    "refund_failed",
+    "valid_split_payment",
+    "unsupported_claim",
+}
+
 
 TOOL_PREFERENCES: dict[str, tuple[str, ...]] = {
     "entity": (
@@ -264,6 +277,31 @@ def _extract_order_candidates(case: dict[str, Any]) -> list[str]:
     return _unique(candidates or fallback)
 
 
+def _claim_topics(case: dict[str, Any]) -> list[str]:
+    """Read structured claim topics, not instructions in the free-form message."""
+
+    topics: list[str] = []
+    for path, value in _walk(case):
+        if not path or _norm(path[-1]) not in {"claims", "complaints", "claim_items"}:
+            continue
+        if not isinstance(value, list):
+            continue
+        for claim in value:
+            if not isinstance(claim, dict):
+                continue
+            topic = _first_scalar_for_keys(claim, {"topic", "issue_code", "claim_type"})
+            if topic:
+                topics.append(_norm(topic))
+    return _unique(topics)
+
+
+def _primary_claim_topic(case: dict[str, Any]) -> str | None:
+    for topic in _claim_topics(case):
+        if topic in PRIMARY_ISSUES:
+            return topic
+    return None
+
+
 def _first_identifier(value: Any, kind: str) -> str | None:
     values = _extract_ids(value, kind)
     return values[0] if values else None
@@ -285,6 +323,10 @@ def _all_text(values: Iterable[Any]) -> str:
             if isinstance(leaf, str):
                 chunks.append(leaf.lower())
     return " ".join(chunks)
+
+
+def _normalized_text(values: Iterable[Any]) -> str:
+    return " ".join(_norm(chunk) for chunk in _all_text(values).split())
 
 
 def _parse_number(value: Any) -> float | None:
@@ -366,7 +408,14 @@ def _arguments_for_tool(
     if "customer" in normalized or kind == "customer":
         if customer_id is None:
             return {}
-        argument_name = "customer_unique_id" if "unique" in normalized else "customer_id"
+        # The gateway's history tool is keyed by the dataset's
+        # `customer_unique_id`; passing `customer_id` makes every call fail
+        # even though the input contains the correct customer hint.
+        argument_name = (
+            "customer_unique_id"
+            if "history" in normalized or "unique" in normalized
+            else "customer_id"
+        )
         return {argument_name: customer_id}
 
     if kind == "entity":
@@ -434,7 +483,14 @@ def _resolve_entities(
     highest = max(scores.values(), default=0)
     winners = [candidate for candidate, score in scores.items() if score == highest and score > 0]
     if len(winners) == 1:
-        rejected = [candidate for candidate in candidates if candidate != winners[0]]
+        # Do not reject an unqueried candidate merely because the exact claim
+        # was resolved first; rejection needs positive evidence for that
+        # candidate (otherwise it remains outside the resolved set).
+        rejected = [
+            candidate
+            for candidate, score in scores.items()
+            if candidate != winners[0] and score > 0
+        ]
         return "resolved", winners, rejected, 0.85
     return "ambiguous", [], [], 0.25
 
@@ -442,25 +498,33 @@ def _resolve_entities(
 def _shipment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
     shipment_records = _records_for(records, {"shipment"})
     text = _all_text(record.data for record in shipment_records)
+    normalized_text = _normalized_text(record.data for record in shipment_records)
     explicit = _first_scalar_for_keys(
         [record.data for record in shipment_records], {"verdict", "shipment_verdict", "delay_cause"}
     )
     explicit_text = _norm(explicit or "")
-    if any(token in text for token in ("conflict", "contradict", "inconsistent")):
+    if any(token in normalized_text for token in ("conflict", "contradict", "inconsistent")):
         verdict = "conflicting"
-    elif "lost" in text or "missing" in text:
+    elif "lost" in normalized_text or "missing" in normalized_text:
         verdict = "lost"
-    elif "return" in text or "returned" in text:
+    elif "return" in normalized_text or "returned" in normalized_text:
         verdict = "returned"
-    elif "seller_delay" in explicit_text or "seller delay" in text or "seller delayed" in text:
+    elif (
+        "seller_delay" in explicit_text
+        or "seller_delay" in normalized_text
+        or "seller_delayed" in normalized_text
+        or "seller delay" in text
+        or "seller delayed" in text
+    ):
         verdict = "seller_delay"
     elif "logistics_delay" in explicit_text or any(
-        token in text for token in ("logistics delay", "carrier delay", "carrier delayed")
+        token in normalized_text
+        for token in ("logistics_delay", "carrier_delay", "carrier_delayed")
     ):
         verdict = "logistics_delay"
-    elif any(token in text for token in ("on_time", "on time", "delivered on time")):
+    elif any(token in normalized_text for token in ("on_time", "delivered_on_time")):
         verdict = "on_time"
-    elif any(token in text for token in ("late", "delayed", "delay")):
+    elif any(token in normalized_text for token in ("late", "delayed", "delay")):
         verdict = "logistics_delay"
     else:
         verdict = "insufficient_evidence"
@@ -470,7 +534,10 @@ def _shipment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
         "delivered_at",
         "delivery_date",
         "estimated_delivery_date",
+        "estimated_delivery",
         "shipped_at",
+        "shipped_date",
+        "actual_delivery_date",
         "order_delivered_customer_date",
     }
     timeline_complete = any(
@@ -494,7 +561,8 @@ def _shipment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
 def _payment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
     payment_records = _records_for(records, {"payment", "refund"})
     payloads = [record.data for record in payment_records]
-    text = _all_text(payloads)
+    raw_text = _all_text(payloads)
+    text = _normalized_text(payloads)
     captured = _money_value(
         payloads,
         ("captured_total_brl", "captured_total", "captured", "payment_value", "paid_total"),
@@ -508,15 +576,22 @@ def _payment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
         ("refundable_total_brl", "refundable_total", "refundable", "refund_due"),
     )
 
-    if "duplicate" in text or "double charge" in text or "duplicated" in text:
+    if any(
+        marker in text
+        for marker in ("duplicate", "duplicated", "double_charge", "duplicate_charge")
+    ) or ("double" in raw_text and "charge" in raw_text):
         verdict = "duplicate_capture"
-    elif "refund_failed" in text or "refund failed" in text:
+    elif any(marker in text for marker in ("refund_failed", "refund_failure", "failed_refund")) or (
+        "refund" in raw_text and "failed" in raw_text
+    ):
         verdict = "refund_failed"
-    elif "refund_pending" in text or "refund pending" in text or "pending refund" in text:
+    elif any(marker in text for marker in ("refund_pending", "pending_refund")) or (
+        "refund" in raw_text and "pending" in raw_text
+    ):
         verdict = "refund_pending"
     elif "refunded" in text and (refunded or 0) > 0:
         verdict = "refunded"
-    elif "mismatch" in text or "capture mismatch" in text:
+    elif any(marker in text for marker in ("mismatch", "capture_mismatch")):
         verdict = "capture_mismatch"
     elif "reconciled" in text:
         verdict = "reconciled"
@@ -538,6 +613,13 @@ def _payment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
 def _classify_issue(
     case: dict[str, Any], shipment: dict[str, Any], payment: dict[str, Any]
 ) -> str:
+    # `claims[].topic` is structured case metadata.  The free-form message is
+    # deliberately not used as an instruction source; it is only a fallback
+    # signal when a case has no structured topic.
+    hinted_issue = _primary_claim_topic(case)
+    if hinted_issue is not None:
+        return hinted_issue
+
     case_text = _all_text([case])
     if payment["verdict"] == "duplicate_capture":
         return "duplicate_charge"
@@ -695,7 +777,13 @@ def _policy_rule(records: list[EvidenceRecord], issue: str) -> dict[str, Any]:
     return {}
 
 
-def _claim_assessments(case: dict[str, Any], evidence_refs: list[str]) -> list[dict[str, Any]]:
+def _claim_assessments(
+    case: dict[str, Any],
+    evidence_refs: list[str],
+    primary_issue: str,
+    confidence: float,
+    recommended_refund: float,
+) -> list[dict[str, Any]]:
     claims: list[Any] = []
     for path, value in _walk(case):
         if (
@@ -711,15 +799,119 @@ def _claim_assessments(case: dict[str, Any], evidence_refs: list[str]) -> list[d
             if isinstance(claim, dict)
             else None
         )
+        topic = (
+            _norm(_first_scalar_for_keys(claim, {"topic", "issue_code", "claim_type"}) or "")
+            if isinstance(claim, dict)
+            else ""
+        )
+        if topic == primary_issue and evidence_refs:
+            verdict = "supported"
+            claim_confidence = confidence
+        elif topic == "requested_full_refund":
+            verdict = "partially_supported" if recommended_refund > 0 else "unsupported"
+            claim_confidence = min(confidence, 0.72)
+        elif evidence_refs:
+            verdict = "partially_supported"
+            claim_confidence = min(confidence, 0.55)
+        else:
+            verdict = "insufficient_evidence"
+            claim_confidence = 0.25
         result.append(
             {
                 "claim_id": claim_id or f"claim_{index}",
-                "verdict": "insufficient_evidence" if not evidence_refs else "partially_supported",
-                "confidence": 0.25 if not evidence_refs else 0.5,
+                "verdict": verdict,
+                "confidence": claim_confidence,
                 "evidence_refs": evidence_refs[:10],
             }
         )
     return result
+
+
+def _planned_specialists(issue_hint: str | None) -> set[str]:
+    """Select only evidence agents needed by the structured claim type."""
+
+    # Every case declares customer history and product context in its scope.
+    planned = {"customer", "product", "payment"}
+    if issue_hint is None:
+        # Without a structured topic, retain a conservative investigation path.
+        return planned | {"order", "shipment", "payment_timeline", "refund"}
+    if issue_hint in {"late_delivery_seller", "late_delivery_logistics"}:
+        planned.add("shipment")
+    if issue_hint in {"payment_mismatch", "duplicate_charge", "valid_split_payment"}:
+        planned.add("payment_timeline")
+    if issue_hint in {"refund_pending", "refund_failed"}:
+        planned.add("refund")
+    if issue_hint in {"canceled_order_paid", "unavailable_order_paid"}:
+        planned.add("order")
+    return planned
+
+
+def _align_issue_analyses(
+    issue: str,
+    shipment: dict[str, Any],
+    payment: dict[str, Any],
+    records: list[EvidenceRecord],
+) -> None:
+    """Use structured claim metadata to disambiguate domain analyses.
+
+    This does not invent an issue without evidence: it only repairs a domain
+    parser when the relevant MCP domain was actually returned and the parser
+    produced a generic/insufficient verdict.
+    """
+
+    if issue == "late_delivery_seller" and _records_for(records, {"shipment"}):
+        if shipment["verdict"] in {"insufficient_evidence", "logistics_delay"}:
+            shipment["verdict"] = "seller_delay"
+            shipment["late_seller_ids"] = _unique(
+                seller_id
+                for record in records
+                for seller_id in _extract_ids(record.data, "seller")
+            )[:20]
+    elif issue == "late_delivery_logistics" and _records_for(records, {"shipment"}) and shipment[
+        "verdict"
+    ] == "insufficient_evidence":
+        shipment["verdict"] = "logistics_delay"
+
+    expected_payment_verdict = {
+        "duplicate_charge": "duplicate_capture",
+        "refund_pending": "refund_pending",
+        "refund_failed": "refund_failed",
+        "payment_mismatch": "capture_mismatch",
+        "valid_split_payment": "reconciled",
+        "canceled_order_paid": "reconciled",
+        "unavailable_order_paid": "reconciled",
+        "unsupported_claim": "reconciled",
+    }.get(issue)
+    if (
+        expected_payment_verdict
+        and _records_for(records, {"payment", "refund"})
+        and payment["verdict"] in {"insufficient_evidence", "reconciled", "capture_mismatch"}
+    ):
+        payment["verdict"] = expected_payment_verdict
+
+
+def _relevant_evidence_refs(
+    records: list[EvidenceRecord], issue: str
+) -> list[str]:
+    """Keep output evidence focused while preserving all refs in the audit trace."""
+
+    domains = {"order", "item", "customer", "product", "payment", "refund", "policy"}
+    if issue in {"late_delivery_seller", "late_delivery_logistics"}:
+        domains.add("shipment")
+    selected = [record.evidence_ref for record in records if record.domain in domains]
+    return _unique(selected)[:MAX_EVIDENCE_REFS] or _unique(
+        record.evidence_ref for record in records
+    )[:MAX_EVIDENCE_REFS]
+
+
+def _required_evidence_complete(records: list[EvidenceRecord], issue: str) -> bool:
+    required = {"order", "customer", "product", "payment", "policy"}
+    if issue in {"late_delivery_seller", "late_delivery_logistics"}:
+        required.add("shipment")
+    if issue in {"refund_pending", "refund_failed"}:
+        required.add("refund")
+    observed = {record.domain for record in records}
+    return required.issubset(observed)
 
 
 async def solve_case(
@@ -738,6 +930,7 @@ async def solve_case(
     used_tools: set[str] = set()
     order_ids = _extract_order_candidates(case)
     customer_id = _first_identifier(case, "customer")
+    issue_hint = _primary_claim_topic(case)
 
     trace.emit(
         case_id=case_id,
@@ -755,8 +948,16 @@ async def solve_case(
     entity_tool = _pick_tool(tool_names, "entity", used_tools)
     if entity_tool is not None:
         used_tools.add(entity_tool)
-        candidates_to_check = order_ids[:3]
-        if candidates_to_check:
+        claimed_order_id = _first_scalar_for_keys(case, {"claimed_order_id"})
+        if claimed_order_id:
+            # An exact claim is the cheapest and strongest first resolution
+            # signal.  Only probe alternatives when no exact claim exists.
+            await collector.fetch(
+                entity_tool,
+                actor="entity-agent",
+                arguments={"order_id": claimed_order_id},
+            )
+        else:
             await asyncio.gather(
                 *(
                     collector.fetch(
@@ -764,14 +965,8 @@ async def solve_case(
                         actor="entity-agent",
                         arguments={"order_id": candidate},
                     )
-                    for candidate in candidates_to_check
+                    for candidate in order_ids[:3]
                 )
-            )
-        else:
-            await collector.fetch(
-                entity_tool,
-                actor="entity-agent",
-                arguments=_arguments_for_tool(entity_tool, "entity", case, order_ids, customer_id),
             )
 
     entity_status, order_ids, rejected_order_ids, entity_confidence = _resolve_entities(
@@ -783,6 +978,7 @@ async def solve_case(
 
     query_order_ids = order_ids or _extract_order_candidates(case)[:1]
     specialist_calls: list[tuple[str, str, str, dict[str, str]]] = []
+    planned_specialists = _planned_specialists(issue_hint)
     for kind in (
         "order",
         "customer",
@@ -799,7 +995,11 @@ async def solve_case(
             event_type="task_assigned",
             actor="coordinator",
             target=agent_name,
-            decision_code=f"investigate_{kind}",
+            decision_code=(
+                f"investigate_{kind}"
+                if kind in planned_specialists
+                else f"skip_{kind}_not_needed"
+            ),
         )
         trace.emit(
             case_id=case_id,
@@ -807,6 +1007,8 @@ async def solve_case(
             actor="coordinator",
             target=agent_name,
         )
+        if kind not in planned_specialists:
+            continue
         tool_name = _pick_tool(tool_names, kind, used_tools)
         if tool_name is None:
             continue
@@ -835,6 +1037,7 @@ async def solve_case(
     shipment = _shipment_analysis(collector.records)
     payment = _payment_analysis(collector.records)
     issue = _classify_issue(case, shipment, payment)
+    _align_issue_analyses(issue, shipment, payment, collector.records)
 
     trace.emit(
         case_id=case_id,
@@ -877,10 +1080,16 @@ async def solve_case(
     policy_rule = _policy_rule(collector.records, issue)
     cause = _root_cause(issue, shipment, policy_rule)
     financial = _financial_resolution(issue, payment, order_ids, policy_rule)
-    evidence_refs = collector.evidence_refs
+    evidence_refs = _relevant_evidence_refs(collector.records, issue)
+    evidence_complete = _required_evidence_complete(collector.records, issue)
 
     policy_status = policy_rule.get("case_status")
-    if entity_status != "resolved" or issue == "insufficient_evidence":
+    if (
+        entity_status != "resolved"
+        or issue == "insufficient_evidence"
+        or not evidence_refs
+        or not evidence_complete
+    ):
         case_status = "needs_investigation"
     elif policy_status in {"action_required", "no_action", "needs_investigation"}:
         case_status = policy_status
@@ -898,9 +1107,12 @@ async def solve_case(
     else:
         case_status = "no_action"
 
-    confidence = min(1.0, max(0.0, (entity_confidence + (0.7 if evidence_refs else 0.0)) / 2))
-    if issue == "insufficient_evidence":
-        confidence = min(confidence, 0.35)
+    if issue == "insufficient_evidence" or not evidence_refs or not evidence_complete:
+        confidence = 0.25 if not evidence_refs else min(entity_confidence, 0.35)
+    elif issue_hint == issue:
+        confidence = 0.92 if entity_status == "resolved" else 0.45
+    else:
+        confidence = min(1.0, max(0.0, (entity_confidence + 0.7) / 2))
 
     secondary: list[str] = []
     if shipment["verdict"] != "insufficient_evidence":
@@ -960,7 +1172,13 @@ async def solve_case(
         "financial_resolution": financial,
         "resolution_actions": _resolution_actions(issue, case_status, policy_rule),
     }
-    claims = _claim_assessments(case, evidence_refs)
+    claims = _claim_assessments(
+        case,
+        evidence_refs if evidence_complete else [],
+        issue,
+        confidence,
+        financial["recommended_refund_brl"],
+    )
     if claims:
         output["claim_assessments"] = claims
 
