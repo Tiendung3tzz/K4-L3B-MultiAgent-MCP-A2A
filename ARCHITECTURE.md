@@ -80,7 +80,10 @@ nghĩa mọi actor đều được gọi mọi tool.
    lọc refs theo issue/domain để tránh giảm evidence precision bởi refs thừa.
 4. Conflict được biểu diễn trong `data_conflicts` với các source đã quan sát,
    `selected_source: null` nếu policy chưa đủ để chọn, và mã
-   `unresolved_source_conflict`.
+   `unresolved_source_conflict`. Chỉ so sánh các giá trị thuộc cùng resolved
+   order; các order khác trong customer history và từng payment installment
+   không phải source conflict của case hiện tại. Chênh lệch payment value được
+   báo cáo khi issue là `payment_mismatch`.
 5. Verifier kiểm tra evidence refs thuộc đúng case/run và output không chứa
    field ngoài L3B schema.
 
@@ -106,6 +109,8 @@ Trước khi finalize, verifier phải bảo đảm:
 
 - `schema_version`, `case_id` và mọi field đúng L3B output schema.
 - Entity ids nằm trong input hoặc evidence của cùng case.
+- `affected_entities` chỉ gồm entity của order đang xử lý; các order khác
+  trong customer history được đưa vào `customer_context.related_order_ids`.
 - Rejected candidates có căn cứ từ evidence; ambiguity không bị biến thành
   resolved.
 - Mọi `evidence_ref` tồn tại trong MCP response và được liên kết với output.

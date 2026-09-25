@@ -232,7 +232,11 @@ def _extract_ids(value: Any, kind: str) -> list[str]:
             for token in ("_id", "_ids", "_ref", "_refs", "reference", "number", "tracking")
         )
         if kind == "order":
-            matches = "order" in name and (id_like or leaf_name in {"order", "orders"})
+            order_identifier = "order" in leaf_name and id_like
+            generic_identifier = leaf_name in {"id", "ids", "ref", "reference"} and any(
+                _norm(part) in {"order", "orders", "related_orders"} for part in path[:-1]
+            )
+            matches = order_identifier or generic_identifier
         elif kind == "item":
             matches = "item" in name and id_like
         elif kind == "seller":
@@ -389,6 +393,45 @@ def _money_value(payloads: Iterable[Any], aliases: tuple[str, ...]) -> float | N
     if not observations:
         return None
     return sum(number for _, number in observations)
+
+
+def _captured_total(records: list[EvidenceRecord]) -> float | None:
+    """Prefer the payment ledger's total, then sum its individual captures."""
+
+    ledgers = [record for record in records if _norm(record.tool_name) == "get_order_payments"]
+    if not ledgers:
+        ledgers = [record for record in records if record.domain == "payment"]
+    if not ledgers:
+        return None
+
+    ledger = ledgers[0].data
+    total_keys = {"captured_total_brl", "captured_total", "paid_total_brl", "paid_total"}
+    row_keys = ("captured_amount_brl", "capture_amount_brl", "payment_value")
+    totals: list[tuple[int, float]] = []
+    for path, value in _walk(ledger):
+        if path and _norm(path[-1]) in total_keys:
+            total = _parse_number(value)
+            if total is not None:
+                totals.append((len(path), total))
+    if totals:
+        return min(totals, key=lambda item: item[0])[1]
+
+    if isinstance(ledger, dict):
+        for key in row_keys:
+            direct = _parse_number(ledger.get(key))
+            if direct is not None:
+                return direct
+
+    for row_key in row_keys:
+        captures = [
+            number
+            for path, value in _walk(ledger)
+            if path and _norm(path[-1]) == row_key
+            if (number := _parse_number(value)) is not None
+        ]
+        if captures:
+            return round(sum(captures), 2)
+    return _money_value([ledger], ("captured", "payment_value"))
 
 
 def _tool_score(name: str, kind: str) -> int:
@@ -592,10 +635,7 @@ def _payment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
     payloads = [record.data for record in payment_records]
     raw_text = _all_text(payloads)
     text = _normalized_text(payloads)
-    captured = _money_value(
-        payloads,
-        ("captured_total_brl", "captured_total", "captured", "payment_value", "paid_total"),
-    )
+    captured = _captured_total(payment_records)
     refunded = _money_value(
         payloads,
         ("refunded_total_brl", "refunded_total", "refunded", "refund_amount", "total_refund"),
@@ -729,37 +769,62 @@ def _root_cause(
     }
 
 
-def _conflicts(records: list[EvidenceRecord]) -> list[dict[str, Any]]:
+def _conflicts(
+    records: list[EvidenceRecord], resolved_order_ids: list[str], issue: str
+) -> list[dict[str, Any]]:
     tracked = {
         "order_status",
-        "status",
         "delivery_date",
         "estimated_delivery_date",
-        "payment_value",
         "refund_status",
         "order_delivered_customer_date",
     }
-    observations: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    if issue == "payment_mismatch":
+        tracked.add("payment_value")
+    observations: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+    target_orders = set(resolved_order_ids)
+
+    def observe(record: EvidenceRecord, node: Any, scoped_order_id: str | None) -> None:
+        if isinstance(node, list):
+            for item in node:
+                observe(record, item, scoped_order_id)
+            return
+        if not isinstance(node, dict):
+            return
+
+        own_order_id = node.get("order_id")
+        if isinstance(own_order_id, str) and own_order_id:
+            scoped_order_id = own_order_id
+
+        for key, value in node.items():
+            field_name = _norm(key)
+            if (
+                field_name in tracked
+                and value is not None
+                and not isinstance(value, (dict, list, bool))
+                and (record.domain != "customer" or scoped_order_id in target_orders)
+                and (scoped_order_id is None or scoped_order_id in target_orders)
+            ):
+                observation = str(value).strip()
+                if observation:
+                    observations[field_name][record.tool_name].add(observation)
+            if isinstance(value, (dict, list)):
+                observe(record, value, scoped_order_id)
+
     for record in records:
-        for path, leaf in _walk(record.data):
-            if not path or _norm(path[-1]) not in tracked:
-                continue
-            if isinstance(leaf, (dict, list)):
-                continue
-            value = str(leaf).strip()
-            if value:
-                observations[_norm(path[-1])].append((record.tool_name, value))
+        observe(record, record.data, None)
 
     result: list[dict[str, Any]] = []
-    for field_name, values in observations.items():
-        distinct_values = _unique(value for _, value in values)
-        sources = _unique(source for source, _ in values)
-        if len(distinct_values) < 2 or len(sources) < 2:
+    for field_name, source_values in observations.items():
+        if len(source_values) < 2:
+            continue
+        values_by_source = list(source_values.values())
+        if set.intersection(*values_by_source):
             continue
         result.append(
             {
                 "field": field_name[:100],
-                "sources": sources[:5],
+                "sources": list(source_values)[:5],
                 "selected_source": None,
                 "resolution_code": "unresolved_source_conflict",
             }
@@ -1109,12 +1174,29 @@ async def solve_case(
         actor="coordinator",
         target="conflict-resolver",
     )
-    conflicts = _conflicts(collector.records)
+    conflicts = _conflicts(collector.records, order_ids, issue)
     policy_rule = _policy_rule(collector.records, issue)
     cause = _root_cause(issue, shipment, policy_rule)
     financial = _financial_resolution(issue, payment, order_ids, policy_rule)
     evidence_refs = _relevant_evidence_refs(collector.records, issue)
     evidence_complete = _required_evidence_complete(collector.records, issue)
+    affected_records = _records_for(
+        collector.records, {"order", "item", "product", "shipment", "seller"}
+    )
+    affected_seller_ids = _unique(
+        seller_id
+        for record in affected_records
+        for seller_id in _extract_ids(record.data, "seller")
+    )
+    for party in cause["responsible_parties"]:
+        if party["party_type"] == "seller" and isinstance(party["party_id"], str):
+            affected_seller_ids = _unique([*affected_seller_ids, party["party_id"]])
+    related_order_ids = _unique(
+        related_id
+        for record in _records_for(collector.records, {"customer"})
+        for related_id in _extract_ids(record.data, "order")
+        if related_id not in order_ids
+    )
 
     policy_status = policy_rule.get("case_status")
     if (
@@ -1168,22 +1250,18 @@ async def solve_case(
             "order_ids": order_ids[:20],
             "item_ids": _unique(
                 item_id
-                for record in collector.records
+                for record in affected_records
                 for item_id in _extract_ids(record.data, "item")
             )[:20],
-            "seller_ids": _unique(
-                seller_id
-                for record in collector.records
-                for seller_id in _extract_ids(record.data, "seller")
-            )[:20],
+            "seller_ids": affected_seller_ids[:20],
             "payment_references": _unique(
                 reference
-                for record in collector.records
+                for record in _records_for(collector.records, {"payment", "refund"})
                 for reference in _extract_ids(record.data, "payment")
             )[:20],
             "shipment_ids": _unique(
                 shipment_id
-                for record in collector.records
+                for record in _records_for(collector.records, {"shipment"})
                 for shipment_id in _extract_ids(record.data, "shipment")
             )[:20],
         },
@@ -1195,7 +1273,7 @@ async def solve_case(
         },
         "customer_context": {
             "customer_unique_id": customer_id,
-            "related_order_ids": order_ids[:20],
+            "related_order_ids": related_order_ids[:20],
         },
         "shipment_analysis": shipment,
         "payment_analysis": payment,
