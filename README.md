@@ -151,6 +151,10 @@ day09 run
 day09 validate
 ```
 
+`day09 run` mặc định xử lý tối đa 4 case đồng thời. Có thể đổi giới hạn này
+ bằng `day09 run --concurrency 1` hoặc một giá trị khác nếu MCP server giới hạn
+ rate/connections. Các case vẫn độc lập theo `case_id`, evidence cache và output.
+
 Kết quả được tạo tại:
 
 ```text

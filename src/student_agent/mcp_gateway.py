@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,10 +14,15 @@ from .contracts import Contracts
 
 
 class EvidenceGateway:
-    def __init__(self, session: ClientSession, contracts: Contracts) -> None:
+    def __init__(
+        self, session: ClientSession, contracts: Contracts, max_concurrent_calls: int = 12
+    ) -> None:
+        if max_concurrent_calls < 1:
+            raise ValueError("max_concurrent_calls must be at least 1")
         self._session = session
         self._contracts = contracts
         self._tool_names: tuple[str, ...] | None = None
+        self._call_semaphore = asyncio.Semaphore(max_concurrent_calls)
 
     async def list_tools(self) -> list[str]:
         if self._tool_names is not None:
@@ -27,7 +33,8 @@ class EvidenceGateway:
 
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
-        result = await self._session.call_tool(tool_name, arguments=payload)
+        async with self._call_semaphore:
+            result = await self._session.call_tool(tool_name, arguments=payload)
         is_error = getattr(result, "isError", None)
         if is_error is None:
             is_error = getattr(result, "is_error", False)

@@ -244,14 +244,35 @@ def _extract_ids(value: Any, kind: str) -> list[str]:
             )
             matches = ("customer" in leaf_name or customer_context) and id_like
         elif kind == "shipment":
-            matches = (
-                ("shipment" in name or "tracking" in name or "delivery" in name)
-                and id_like
+            # Use the identifier field itself, not a broad ancestor path.
+            # Otherwise shipment.seller_id or shipment.order_id is falsely
+            # emitted as a shipment id.
+            shipment_identifier = any(
+                token in leaf_name
+                for token in ("shipment", "tracking", "delivery")
             )
+            generic_identifier = leaf_name in {"id", "ids", "ref", "reference"} and any(
+                _norm(part) in {"shipment", "tracking", "delivery"} for part in path[:-1]
+            )
+            matches = (id_like and shipment_identifier) or generic_identifier
         elif kind == "payment":
-            matches = (
-                ("payment" in name or "transaction" in name or "charge" in name)
-                and id_like
+            # Payment records frequently include their parent order_id. Keep
+            # payment/transaction/charge references and generic ids nested in
+            # those objects, but never promote order_id to payment reference.
+            payment_identifier = any(
+                token in leaf_name for token in ("payment", "transaction", "charge")
+            )
+            generic_identifier = leaf_name in {"id", "ids", "ref", "reference"} and any(
+                _norm(part)
+                in {"payment", "payments", "transaction", "transactions", "charge", "charges"}
+                for part in path[:-1]
+            )
+            blocked_identifier = any(
+                token in leaf_name
+                for token in ("order", "seller", "customer", "shipment", "item")
+            )
+            matches = not blocked_identifier and (
+                (id_like and payment_identifier) or generic_identifier
             )
         else:
             matches = False
@@ -491,7 +512,9 @@ def _resolve_entities(
             for candidate, score in scores.items()
             if candidate != winners[0] and score > 0
         ]
-        return "resolved", winners, rejected, 0.85
+        claimed_order_id = _first_scalar_for_keys(case, {"claimed_order_id"})
+        confidence = 0.95 if winners[0] == claimed_order_id else 0.85
+        return "resolved", winners, rejected, confidence
     return "ambiguous", [], [], 0.25
 
 
@@ -532,11 +555,17 @@ def _shipment_analysis(records: list[EvidenceRecord]) -> dict[str, Any]:
     timeline_keys = {
         "timeline",
         "delivered_at",
+        "delivered_on",
         "delivery_date",
+        "delivery_timestamp",
         "estimated_delivery_date",
         "estimated_delivery",
+        "estimated_delivery_at",
+        "order_estimated_delivery_date",
+        "order_delivered_carrier_date",
         "shipped_at",
         "shipped_date",
+        "shipping_limit_date",
         "actual_delivery_date",
         "order_delivered_customer_date",
     }
@@ -690,6 +719,10 @@ def _root_cause(
         and not policy_rule
     ):
         party_type, party_id = "unknown", None
+    if issue == "late_delivery_seller" and shipment.get("late_seller_ids"):
+        party_type = "seller"
+        if party_id not in shipment["late_seller_ids"]:
+            party_id = shipment["late_seller_ids"][0]
     return {
         "ranked_causes": [{"cause_code": cause, "rank": 1}],
         "responsible_parties": [{"party_type": party_type, "party_id": party_id}],
@@ -864,7 +897,7 @@ def _align_issue_analyses(
             shipment["verdict"] = "seller_delay"
             shipment["late_seller_ids"] = _unique(
                 seller_id
-                for record in records
+                for record in _records_for(records, {"shipment"})
                 for seller_id in _extract_ids(record.data, "seller")
             )[:20]
     elif issue == "late_delivery_logistics" and _records_for(records, {"shipment"}) and shipment[
@@ -1209,8 +1242,6 @@ async def solve_case(
 def _resolution_actions(
     issue: str, case_status: str, policy_rule: dict[str, Any] | None = None
 ) -> list[str]:
-    if case_status == "needs_investigation":
-        return ["collect_missing_evidence"]
     recommended_action = policy_rule.get("recommended_action") if policy_rule else None
     policy_actions = {
         "issue_refund": ["process_refund"],
@@ -1223,6 +1254,8 @@ def _resolution_actions(
     }
     if recommended_action in policy_actions:
         return policy_actions[recommended_action]
+    if case_status == "needs_investigation":
+        return ["collect_missing_evidence"]
     actions = {
         "canceled_order_paid": ["validate_cancellation", "process_refund"],
         "unavailable_order_paid": ["confirm_unavailability", "process_refund"],

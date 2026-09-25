@@ -119,9 +119,13 @@ Trước khi finalize, verifier phải bảo đảm:
 ## 7. Reproducibility
 
 - Runtime: Python 3.11+; dependency versions nằm trong `pyproject.toml`.
-- Concurrency: workflow xử lý tuần tự từng case; các specialist calls độc lập
-  được chạy đồng thời sau entity resolution, trong khi policy và verifier vẫn
-  chạy sau khi specialist pass hoàn tất.
+- Concurrency: mặc định chạy tối đa 4 case đồng thời bằng `asyncio`; mỗi case có
+  `EvidenceCollector` và cache riêng, output riêng, còn gateway giới hạn tối đa
+  12 MCP calls đồng thời. Các specialist calls độc lập trong cùng case vẫn
+  chạy đồng thời sau entity resolution; policy và verifier chạy sau specialist
+  pass của chính case đó.
+- Trace có thể interleave giữa các case, nhưng mọi event luôn mang `case_id`;
+  thứ tự lifecycle được kiểm tra độc lập trong từng case.
 - Retry delay: 0.05 giây nhân theo số lần thử; tối đa 2 retries cho một call.
 - Lệnh chạy: `day09 mcp-tools`, `day09 run`, `day09 validate`, và
   `day09 package --output dist/submission.zip`.
